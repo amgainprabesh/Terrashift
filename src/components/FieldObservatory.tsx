@@ -1368,9 +1368,6 @@ export function FieldObservatory({
   onOpenTwin3D,
   onOpenOptimizer,
 }: FieldObservatoryProps) {
-  const [latInput, setLatInput] = useState(parcel.lat.toFixed(4));
-  const [lngInput, setLngInput] = useState(parcel.lng.toFixed(4));
-
   const [quickCheck, setQuickCheck] = useState<{
     text: string;
     model: string;
@@ -1395,8 +1392,6 @@ export function FieldObservatory({
   const [externalLoading, setExternalLoading] = useState(false);
 
   useEffect(() => {
-    setLatInput(parcel.lat.toFixed(4));
-    setLngInput(parcel.lng.toFixed(4));
     setQuickCheck(null);
     setSearchGrounding(null);
     setMapsGrounding(null);
@@ -1416,16 +1411,6 @@ export function FieldObservatory({
       cancelled = true;
     };
   }, [parcel.id, parcel.lat, parcel.lng]);
-
-  const handleCoordinateSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const lat = Number(latInput);
-    const lng = Number(lngInput);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      return;
-    }
-    onInspectCoordinates(lat, lng, `Custom Parcel (${lat.toFixed(3)}, ${lng.toFixed(3)})`);
-  };
 
   const handleRunQuickCheck = async () => {
     setQuickBusy(true);
@@ -1539,7 +1524,7 @@ export function FieldObservatory({
               </span>
             </div>
 
-            <div className="mt-3 space-y-2">
+            <div className="mt-3 space-y-2.5">
               {CURATED_PARCELS.map((item) => {
                 const active = item.id === parcel.id;
                 return (
@@ -1548,7 +1533,7 @@ export function FieldObservatory({
                     type="button"
                     data-parcel-id={item.id}
                     onClick={() => onSelectParcel(item)}
-                    className={`w-full rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                    className={`w-full rounded-lg border px-3 py-3 text-left transition-colors ${
                       active
                         ? 'border-sky-700 bg-sky-50/70'
                         : 'border-slate-200 bg-white hover:bg-slate-50'
@@ -1569,35 +1554,6 @@ export function FieldObservatory({
                   </button>
                 );
               })}
-            </div>
-
-            <div className="mt-4 border-t border-slate-100 pt-4">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
-                Direct Decimal Coordinate Tuner
-              </p>
-
-              <form onSubmit={handleCoordinateSubmit} className="flex items-center gap-2">
-                <input
-                  type="text"
-                  aria-label="Latitude"
-                  value={latInput}
-                  onChange={(e) => setLatInput(e.target.value)}
-                  className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 font-mono text-xs text-slate-800 focus:border-sky-600 focus:outline-none"
-                />
-                <input
-                  type="text"
-                  aria-label="Longitude"
-                  value={lngInput}
-                  onChange={(e) => setLngInput(e.target.value)}
-                  className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2.5 py-1.5 font-mono text-xs text-slate-800 focus:border-sky-600 focus:outline-none"
-                />
-                <button
-                  type="submit"
-                  className="shrink-0 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
-                >
-                  Inspect
-                </button>
-              </form>
             </div>
           </div>
 
