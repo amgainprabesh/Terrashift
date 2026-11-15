@@ -7,6 +7,8 @@ import {
   deriveFiveYearSoilNutrientTrends,
   deriveMultiYearClimateTrends,
   optimizeCropRotation,
+  parseCoordinateQuery,
+  searchAgriculturalDirectory,
 } from './agronomy';
 
 test('analyzeNasaPowerPayload parses monthly NASA POWER parameters into summary metrics', () => {
@@ -165,5 +167,35 @@ test('deriveMultiYearClimateTrends computes 60 monthly points, 5 annual rollups,
   assert.equal(climate.driestYearLabel, '2023');
   assert.ok(climate.adaptationAdvisory.length > 20);
 });
+
+test('parseCoordinateQuery parses decimal and cardinal coordinate strings accurately', () => {
+  const dec = parseCoordinateQuery('36.7378, -119.7871');
+  assert.ok(dec);
+  assert.equal(dec.lat, 36.7378);
+  assert.equal(dec.lng, -119.7871);
+
+  const cardinal = parseCoordinateQuery('30.9010° N, 75.8573° W');
+  assert.ok(cardinal);
+  assert.equal(cardinal.lat, 30.901);
+  assert.equal(cardinal.lng, -75.8573);
+
+  assert.equal(parseCoordinateQuery('San Joaquin Valley'), null);
+  assert.equal(parseCoordinateQuery('99.5, -119.7'), null);
+});
+
+test('searchAgriculturalDirectory ranks matching farm regions, crops, and soil types', () => {
+  const caResults = searchAgriculturalDirectory('San Joaquin');
+  assert.ok(caResults.length > 0);
+  assert.ok(caResults[0].name.includes('San Joaquin'));
+
+  const aquiferResults = searchAgriculturalDirectory('Ogallala');
+  assert.ok(aquiferResults.length > 0);
+  assert.equal(aquiferResults[0].id, 'dir-ogallala-kansas');
+
+  const chernozemResults = searchAgriculturalDirectory('Chernozem');
+  assert.ok(chernozemResults.length > 0);
+  assert.equal(chernozemResults[0].country, 'Ukraine');
+});
+
 
 

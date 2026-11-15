@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AdvancedMarker,
   InfoWindow,
   Map as GoogleMap,
   Pin,
   useAdvancedMarkerRef,
+  useMap,
   useMapsLibrary,
 } from '@vis.gl/react-google-maps';
 import {
@@ -20,19 +21,28 @@ import {
 import {
   CloudSun,
   Compass,
+  Crosshair,
   Droplets,
   ExternalLink,
   Loader2,
+  LocateFixed,
   MapPin,
+  Minus,
+  Plus,
+  RotateCcw,
   Satellite,
   Search,
   Sparkles,
+  X,
   Zap,
 } from 'lucide-react';
 import {
   CURATED_PARCELS,
   deriveFiveYearSoilNutrientTrends,
   getCropById,
+  parseCoordinateQuery,
+  searchAgriculturalDirectory,
+  type AgriculturalDirectoryEntry,
   type FarmParcelProfile,
   type FiveYearSoilNutrientPoint,
   type NasaPowerSummary,
@@ -422,73 +432,726 @@ function FiveYearSoilNutrientRechart({
   );
 }
 
-function PlacesSearchMount({
-  onPlacePicked,
+interface FetchedPlaceLike {
+  displayName?: string | null;
+  formattedAddress?: string | null;
+  location?: {
+    lat: number | (() => number);
+    lng: number | (() => number);
+  } | null;
+  fetchFields: (opts: { fields: string[] }) => Promise<unknown>;
+}
+
+interface LivePlacePredictionItem {
+  id: string;
+  mainText: string;
+  secondaryText: string;
+  fullText: string;
+  toPlace: () => FetchedPlaceLike;
+}
+
+function GooglePlacesLiveBridge({
+  query,
+  biasLat,
+  biasLng,
+  onPredictions,
+  onLoadingChange,
+  resetTrigger,
 }: {
-  onPlacePicked: (lat: number, lng: number, label: string) => void;
+  query: string;
+  biasLat: number;
+  biasLng: number;
+  onPredictions: (items: LivePlacePredictionItem[]) => void;
+  onLoadingChange: (loading: boolean) => void;
+  resetTrigger: number;
 }) {
   const placesLib = useMapsLibrary('places');
-  const mountRef = useRef<HTMLDivElement | null>(null);
-  const callbackRef = useRef(onPlacePicked);
-  callbackRef.current = onPlacePicked;
+  const sessionTokenRef = useRef<unknown>(null);
+  const onPredictionsRef = useRef(onPredictions);
+  onPredictionsRef.current = onPredictions;
+  const onLoadingRef = useRef(onLoadingChange);
+  onLoadingRef.current = onLoadingChange;
 
   useEffect(() => {
-    const container = mountRef.current;
-    if (!placesLib || !container) return;
+    sessionTokenRef.current = null;
+  }, [resetTrigger]);
 
-    const ctor = (
-      placesLib as unknown as {
-        PlaceAutocompleteElement?: new () => HTMLElement;
-      }
-    ).PlaceAutocompleteElement;
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!placesLib || trimmed.length < 2 || parseCoordinateQuery(trimmed)) {
+      onPredictionsRef.current([]);
+      onLoadingRef.current(false);
+      return;
+    }
 
-    if (!ctor) return;
+    const typedPlacesLib = placesLib as unknown as {
+      AutocompleteSessionToken?: new () => unknown;
+      AutocompleteSuggestion?: {
+        fetchAutocompleteSuggestions?: (req: {
+          input: string;
+          sessionToken?: unknown;
+          locationBias?: {
+            west: number;
+            south: number;
+            east: number;
+            north: number;
+          };
+        }) => Promise<{
+          suggestions?: Array<{
+            placePrediction?: {
+              placeId?: string;
+              mainText?: { text?: string };
+              secondaryText?: { text?: string };
+              text?: { text?: string };
+              toPlace?: () => FetchedPlaceLike;
+            };
+          }>;
+        }>;
+      };
+    };
 
-    container.innerHTML = '';
-    const el = new ctor();
-    el.style.width = '100%';
-    el.setAttribute('placeholder', 'Search farm valley, county, or coordinates...');
+    const { AutocompleteSessionToken, AutocompleteSuggestion } = typedPlacesLib;
+    if (!AutocompleteSuggestion?.fetchAutocompleteSuggestions) {
+      onPredictionsRef.current([]);
+      onLoadingRef.current(false);
+      return;
+    }
 
-    const handleSelect = async (event: Event) => {
+    if (!sessionTokenRef.current && AutocompleteSessionToken) {
+      sessionTokenRef.current = new AutocompleteSessionToken();
+    }
+
+    let cancelled = false;
+    onLoadingRef.current(true);
+
+    const timer = window.setTimeout(async () => {
       try {
-        interface PlaceLike {
-          displayName?: string;
-          formattedAddress?: string;
-          location?: { lat: number | (() => number); lng: number | (() => number) };
-          fetchFields: (opts: { fields: string[] }) => Promise<void>;
+        const res =
+          await AutocompleteSuggestion.fetchAutocompleteSuggestions!({
+            input: trimmed,
+            sessionToken: sessionTokenRef.current ?? undefined,
+            locationBias: {
+              west: Math.max(-180, biasLng - 2.5),
+              south: Math.max(-90, biasLat - 2.5),
+              east: Math.min(180, biasLng + 2.5),
+              north: Math.min(90, biasLat + 2.5),
+            },
+          });
+        if (cancelled) return;
+
+        const mapped: LivePlacePredictionItem[] = [];
+        for (const s of res.suggestions ?? []) {
+          const pred = s.placePrediction;
+          if (!pred || typeof pred.toPlace !== 'function') continue;
+          const toPlaceFn = pred.toPlace.bind(pred);
+          const mainText =
+            pred.mainText?.text || pred.text?.text || trimmed;
+          const secondaryText = pred.secondaryText?.text || '';
+          const fullText = pred.text?.text || mainText;
+          mapped.push({
+            id: pred.placeId || fullText,
+            mainText,
+            secondaryText,
+            fullText,
+            toPlace: () => toPlaceFn(),
+          });
         }
-        const custom = event as CustomEvent & {
-          placePrediction?: { toPlace?: () => PlaceLike };
-        };
-        const place = custom.placePrediction?.toPlace?.();
-        if (!place) return;
-        await place.fetchFields({ fields: ['displayName', 'formattedAddress', 'location'] });
+        onPredictionsRef.current(mapped.slice(0, 5));
+      } catch (err) {
+        const msg = String(err);
+        if (
+          msg.includes('429') ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('OVER_QUERY_LIMIT') ||
+          msg.includes('QuotaExceeded')
+        ) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
+        if (!cancelled) {
+          onPredictionsRef.current([]);
+        }
+      } finally {
+        if (!cancelled) {
+          onLoadingRef.current(false);
+        }
+      }
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [placesLib, query, biasLat, biasLng]);
+
+  return null;
+}
+
+interface OmniboxActionItem {
+  key: string;
+  kind: 'coordinate' | 'place' | 'directory';
+  title: string;
+  subtitle: string;
+  badge: string;
+  lat?: number;
+  lng?: number;
+  onTrigger: () => void | Promise<void>;
+}
+
+const QUICK_REGION_CHIPS: Array<{
+  label: string;
+  lat: number;
+  lng: number;
+  fullLabel: string;
+  parcelId?: string;
+}> = [
+  {
+    label: 'Central Iowa',
+    lat: 41.5868,
+    lng: -93.625,
+    fullLabel: 'Central Iowa Corn Belt',
+    parcelId: 'iowa-cornbelt',
+  },
+  {
+    label: 'San Joaquin CA',
+    lat: 36.7378,
+    lng: -119.7871,
+    fullLabel: 'San Joaquin Valley, CA',
+    parcelId: 'california-sanjoaquin',
+  },
+  {
+    label: 'Ogallala Aquifer KS',
+    lat: 37.9717,
+    lng: -100.8727,
+    fullLabel: 'Ogallala Aquifer High Plains, KS',
+  },
+  {
+    label: 'Punjab Plain',
+    lat: 30.901,
+    lng: 75.8573,
+    fullLabel: 'Indo-Gangetic Plain, Punjab',
+    parcelId: 'punjab-indogangetic',
+  },
+  {
+    label: 'Nile Delta',
+    lat: 31.1107,
+    lng: 30.9388,
+    fullLabel: 'Nile River Delta Basin, Egypt',
+  },
+  {
+    label: 'Mato Grosso BR',
+    lat: -12.5449,
+    lng: -55.7226,
+    fullLabel: 'Mato Grosso Cerrado, Brazil',
+    parcelId: 'matogrosso-cerrado',
+  },
+];
+
+function LocationOmnibox({
+  parcel,
+  mapsAvailable,
+  onSelectParcel,
+  onInspectCoordinates,
+}: {
+  parcel: FarmParcelProfile;
+  mapsAvailable: boolean;
+  onSelectParcel: (parcel: FarmParcelProfile) => void;
+  onInspectCoordinates: (lat: number, lng: number, label?: string) => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [isOpen, setIsOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [livePredictions, setLivePredictions] = useState<
+    LivePlacePredictionItem[]
+  >([]);
+  const [placesLoading, setPlacesLoading] = useState(false);
+  const [sessionResetSeq, setSessionResetSeq] = useState(0);
+  const [geoBusy, setGeoBusy] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const parsedCoord = useMemo(() => parseCoordinateQuery(query), [query]);
+  const directoryMatches = useMemo(
+    () => searchAgriculturalDirectory(query, query.trim() ? 5 : 6),
+    [query]
+  );
+
+  // Global "/" or Cmd+K shortcut to focus search bar
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        inputRef.current?.focus();
+        setIsOpen(true);
+        return;
+      }
+      if (
+        e.key === '/' &&
+        document.activeElement &&
+        !['INPUT', 'TEXTAREA', 'SELECT'].includes(
+          document.activeElement.tagName
+        )
+      ) {
+        e.preventDefault();
+        inputRef.current?.focus();
+        setIsOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(e.target as Node)
+      ) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, []);
+
+  const handlePickPlacePrediction = useCallback(
+    async (item: LivePlacePredictionItem) => {
+      try {
+        setPlacesLoading(true);
+        const place = item.toPlace();
+        await place.fetchFields({
+          fields: ['displayName', 'formattedAddress', 'location', 'viewport'],
+        });
+        setSessionResetSeq((n) => n + 1);
+        setLivePredictions([]);
+
         const loc = place.location;
         if (!loc) return;
         const lat = typeof loc.lat === 'function' ? loc.lat() : Number(loc.lat);
         const lng = typeof loc.lng === 'function' ? loc.lng() : Number(loc.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
         const label =
           place.displayName ||
+          item.mainText ||
           place.formattedAddress ||
           `Parcel (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
-        callbackRef.current(lat, lng, label);
+        setQuery(label);
+        setIsOpen(false);
+        setStatusMessage(null);
+        onInspectCoordinates(lat, lng, label);
       } catch (err) {
+        const msg = String(err);
+        if (
+          msg.includes('429') ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('OVER_QUERY_LIMIT')
+        ) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+        }
         console.warn('Place selection error:', err);
+      } finally {
+        setPlacesLoading(false);
       }
-    };
+    },
+    [onInspectCoordinates]
+  );
 
-    el.addEventListener('gmp-select', handleSelect);
-    el.addEventListener('gmp-placeselect', handleSelect);
-    container.appendChild(el);
+  const handlePickDirectoryEntry = useCallback(
+    (entry: AgriculturalDirectoryEntry) => {
+      setQuery(entry.name);
+      setIsOpen(false);
+      setStatusMessage(null);
+      if (entry.parcelPreset) {
+        onSelectParcel(entry.parcelPreset);
+      } else {
+        onInspectCoordinates(entry.lat, entry.lng, `${entry.name} (${entry.region})`);
+      }
+    },
+    [onInspectCoordinates, onSelectParcel]
+  );
 
-    return () => {
-      el.removeEventListener('gmp-select', handleSelect);
-      el.removeEventListener('gmp-placeselect', handleSelect);
-      container.innerHTML = '';
-    };
-  }, [placesLib]);
+  const actionItems = useMemo<OmniboxActionItem[]>(() => {
+    const list: OmniboxActionItem[] = [];
 
-  return <div ref={mountRef} className="min-h-[38px] w-full min-w-0 overflow-hidden" />;
+    if (parsedCoord) {
+      list.push({
+        key: `coord-${parsedCoord.formatted}`,
+        kind: 'coordinate',
+        title: `Inspect Coordinates ${parsedCoord.formatted}`,
+        subtitle: `Direct satellite & NASA POWER point query at Lat ${parsedCoord.lat}, Lng ${parsedCoord.lng}`,
+        badge: 'GPS COORD',
+        lat: parsedCoord.lat,
+        lng: parsedCoord.lng,
+        onTrigger: () => {
+          setQuery(parsedCoord.formatted);
+          setIsOpen(false);
+          setStatusMessage(null);
+          onInspectCoordinates(
+            parsedCoord.lat,
+            parsedCoord.lng,
+            `Custom Sector (${parsedCoord.formatted})`
+          );
+        },
+      });
+    }
+
+    for (const pred of livePredictions) {
+      list.push({
+        key: `place-${pred.id}`,
+        kind: 'place',
+        title: pred.mainText,
+        subtitle: pred.secondaryText || pred.fullText,
+        badge: 'GOOGLE MAPS',
+        onTrigger: () => handlePickPlacePrediction(pred),
+      });
+    }
+
+    for (const entry of directoryMatches) {
+      list.push({
+        key: `dir-${entry.id}`,
+        kind: 'directory',
+        title: entry.name,
+        subtitle: `${entry.region} · ${entry.soilType} · ${entry.primaryCrop}`,
+        badge: entry.climateTag.toUpperCase(),
+        lat: entry.lat,
+        lng: entry.lng,
+        onTrigger: () => handlePickDirectoryEntry(entry),
+      });
+    }
+
+    return list;
+  }, [
+    parsedCoord,
+    livePredictions,
+    directoryMatches,
+    onInspectCoordinates,
+    handlePickPlacePrediction,
+    handlePickDirectoryEntry,
+  ]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query, livePredictions.length, directoryMatches.length]);
+
+  const handleUseMyLocation = () => {
+    if (!navigator.geolocation) {
+      setStatusMessage('Geolocation is not supported by this browser.');
+      return;
+    }
+    setGeoBusy(true);
+    setStatusMessage(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGeoBusy(false);
+        const lat = Number(pos.coords.latitude.toFixed(4));
+        const lng = Number(pos.coords.longitude.toFixed(4));
+        setQuery(`${lat}, ${lng}`);
+        setIsOpen(false);
+        onInspectCoordinates(lat, lng, `GPS Field Location (${lat.toFixed(3)}, ${lng.toFixed(3)})`);
+      },
+      () => {
+        setGeoBusy(false);
+        setStatusMessage('Location permission declined; type a region or coordinates above.');
+      },
+      { enableHighAccuracy: false, timeout: 6000 }
+    );
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!isOpen) {
+        setIsOpen(true);
+        return;
+      }
+      setActiveIndex((prev) =>
+        actionItems.length > 0 ? (prev + 1) % actionItems.length : 0
+      );
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!isOpen) {
+        setIsOpen(true);
+        return;
+      }
+      setActiveIndex((prev) =>
+        actionItems.length > 0
+          ? (prev - 1 + actionItems.length) % actionItems.length
+          : 0
+      );
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const chosen = actionItems[activeIndex] ?? actionItems[0];
+      if (chosen) {
+        void chosen.onTrigger();
+      } else if (parsedCoord) {
+        setIsOpen(false);
+        onInspectCoordinates(
+          parsedCoord.lat,
+          parsedCoord.lng,
+          `Custom Sector (${parsedCoord.formatted})`
+        );
+      }
+    } else if (e.key === 'Escape') {
+      setIsOpen(false);
+      inputRef.current?.blur();
+    }
+  };
+
+  return (
+    <div ref={containerRef} className="relative z-20 space-y-2">
+      {mapsAvailable && (
+        <GooglePlacesLiveBridge
+          query={query}
+          biasLat={parcel.lat}
+          biasLng={parcel.lng}
+          onPredictions={setLivePredictions}
+          onLoadingChange={setPlacesLoading}
+          resetTrigger={sessionResetSeq}
+        />
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-[240px] flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            ref={inputRef}
+            type="text"
+            data-testid="location-search-input"
+            aria-label="Search farm valley, county, address, or coordinates"
+            value={query}
+            onFocus={() => setIsOpen(true)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setIsOpen(true);
+              if (statusMessage) setStatusMessage(null);
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder="Search any farm valley, county, address, crop belt, or lat, lng (e.g. San Joaquin, Ogallala, 36.74, -119.77)..."
+            className="w-full rounded-xl border border-slate-300 bg-slate-50/70 py-2.5 pr-24 pl-9 text-xs font-medium text-slate-900 placeholder:text-slate-400 transition-colors focus:border-sky-600 focus:bg-white focus:ring-2 focus:ring-sky-600/15 focus:outline-none"
+          />
+
+          <div className="absolute right-2.5 top-1/2 flex -translate-y-1/2 items-center gap-1">
+            {placesLoading && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-600" />
+            )}
+            {query ? (
+              <button
+                type="button"
+                aria-label="Clear search query"
+                onClick={() => {
+                  setQuery('');
+                  setLivePredictions([]);
+                  inputRef.current?.focus();
+                  setIsOpen(true);
+                }}
+                className="rounded-md p-1 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : (
+              <kbd className="hidden rounded border border-slate-200 bg-white px-1.5 py-0.5 font-mono text-[10px] text-slate-400 sm:inline-block">
+                /
+              </kbd>
+            )}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleUseMyLocation}
+          disabled={geoBusy}
+          title="Inspect my current GPS coordinates"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-60"
+        >
+          {geoBusy ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-700" />
+          ) : (
+            <LocateFixed className="h-3.5 w-3.5 text-sky-700" />
+          )}
+          <span className="hidden sm:inline">My GPS</span>
+        </button>
+      </div>
+
+      {/* Quick-jump region chips */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.05em] text-slate-400">
+          Quick Valleys:
+        </span>
+        {QUICK_REGION_CHIPS.map((chip) => {
+          const isCurrent =
+            Math.abs(parcel.lat - chip.lat) < 0.05 &&
+            Math.abs(parcel.lng - chip.lng) < 0.05;
+          return (
+            <button
+              key={chip.label}
+              type="button"
+              onClick={() => {
+                setIsOpen(false);
+                setQuery('');
+                const matchedParcel = chip.parcelId
+                  ? CURATED_PARCELS.find((p) => p.id === chip.parcelId)
+                  : undefined;
+                if (matchedParcel) {
+                  onSelectParcel(matchedParcel);
+                } else {
+                  onInspectCoordinates(chip.lat, chip.lng, chip.fullLabel);
+                }
+              }}
+              className={`rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                isCurrent
+                  ? 'border-sky-700 bg-sky-50 font-semibold text-sky-900'
+                  : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'
+              }`}
+            >
+              {chip.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {statusMessage && (
+        <p className="text-[11px] font-medium text-amber-700">{statusMessage}</p>
+      )}
+
+      {/* Rich Dropdown Suggestions */}
+      {isOpen && actionItems.length > 0 && (
+        <div
+          data-testid="location-search-dropdown"
+          role="listbox"
+          className="absolute left-0 right-0 top-[44px] z-30 max-h-[340px] overflow-y-auto rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl"
+        >
+          <div className="flex items-center justify-between px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-slate-400">
+            <span>
+              {query.trim()
+                ? 'Matching Places, Coordinates & Agricultural Basins'
+                : 'Featured Agricultural Valleys & Benchmarks'}
+            </span>
+            <span className="font-mono">↑↓ Enter</span>
+          </div>
+
+          <div className="mt-0.5 space-y-0.5">
+            {actionItems.map((item, idx) => {
+              const highlighted = idx === activeIndex;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  role="option"
+                  aria-selected={highlighted}
+                  data-testid={`search-suggestion-${idx}`}
+                  onMouseEnter={() => setActiveIndex(idx)}
+                  onMouseDown={(e) => {
+                    // Prevent input blur before click handler runs
+                    e.preventDefault();
+                    void item.onTrigger();
+                  }}
+                  className={`flex w-full items-start justify-between gap-3 rounded-lg px-2.5 py-2 text-left transition-colors ${
+                    highlighted ? 'bg-sky-50/90 text-slate-950' : 'hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex min-w-0 items-start gap-2.5">
+                    <MapPin
+                      className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${
+                        item.kind === 'place'
+                          ? 'text-sky-700'
+                          : item.kind === 'coordinate'
+                            ? 'text-amber-600'
+                            : 'text-emerald-700'
+                      }`}
+                    />
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-semibold text-slate-900">
+                        {item.title}
+                      </p>
+                      <p className="truncate text-[11px] text-slate-500">
+                        {item.subtitle}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 flex-col items-end gap-0.5">
+                    <span
+                      className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold ${
+                        item.kind === 'place'
+                          ? 'bg-sky-100 text-sky-900'
+                          : item.kind === 'coordinate'
+                            ? 'bg-amber-100 text-amber-900'
+                            : 'bg-emerald-100 text-emerald-900'
+                      }`}
+                    >
+                      {item.badge}
+                    </span>
+                    {item.lat !== undefined && item.lng !== undefined && (
+                      <span className="font-mono tabular-nums text-[10px] text-slate-400">
+                        {item.lat.toFixed(2)}, {item.lng.toFixed(2)}
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Uncontrolled Google Map camera synchronizer.
+ * Only pans the map when the selected parcel coordinates or explicit recenter trigger change,
+ * leaving cursor drag/pan and wheel zoom 100% native and lag-free.
+ */
+function MapCameraController({
+  targetLat,
+  targetLng,
+  recenterSeq,
+  zoomCommand,
+}: {
+  targetLat: number;
+  targetLng: number;
+  recenterSeq: number;
+  zoomCommand: { seq: number; delta: number };
+}) {
+  const map = useMap();
+  const lastTargetRef = useRef<{ lat: number; lng: number; seq: number }>({
+    lat: targetLat,
+    lng: targetLng,
+    seq: recenterSeq,
+  });
+  const lastZoomSeqRef = useRef(0);
+
+  useEffect(() => {
+    if (!map) return;
+    const prev = lastTargetRef.current;
+    const coordsChanged =
+      Math.abs(prev.lat - targetLat) > 1e-5 ||
+      Math.abs(prev.lng - targetLng) > 1e-5;
+    const recenterRequested = prev.seq !== recenterSeq;
+
+    if (coordsChanged || recenterRequested) {
+      lastTargetRef.current = {
+        lat: targetLat,
+        lng: targetLng,
+        seq: recenterSeq,
+      };
+      map.panTo({ lat: targetLat, lng: targetLng });
+    }
+  }, [map, targetLat, targetLng, recenterSeq]);
+
+  useEffect(() => {
+    if (!map || zoomCommand.seq === 0 || zoomCommand.seq === lastZoomSeqRef.current) {
+      return;
+    }
+    lastZoomSeqRef.current = zoomCommand.seq;
+    const currentZoom = map.getZoom() ?? 11;
+    map.setZoom(Math.max(2, Math.min(20, currentZoom + zoomCommand.delta)));
+  }, [map, zoomCommand]);
+
+  return null;
 }
 
 function SatelliteMapCanvas({
@@ -498,25 +1161,52 @@ function SatelliteMapCanvas({
 }: {
   parcel: FarmParcelProfile;
   nasa: NasaPowerSummary;
-  onInspectCoordinates: (lat: number, lng: number) => void;
+  onInspectCoordinates: (lat: number, lng: number, label?: string) => void;
 }) {
   const [mapType, setMapType] = useState<'hybrid' | 'terrain'>('hybrid');
   const [infoOpen, setInfoOpen] = useState(false);
   const [markerRef, marker] = useAdvancedMarkerRef();
-  const [zoom, setZoom] = useState(11);
+  const [recenterSeq, setRecenterSeq] = useState(0);
+  const [zoomCommand, setZoomCommand] = useState({ seq: 0, delta: 0 });
+  const [pannedCenter, setPannedCenter] = useState<{
+    lat: number;
+    lng: number;
+  }>({ lat: parcel.lat, lng: parcel.lng });
+
+  useEffect(() => {
+    setPannedCenter({ lat: parcel.lat, lng: parcel.lng });
+  }, [parcel.lat, parcel.lng]);
+
+  const isPannedAway =
+    Math.hypot(pannedCenter.lat - parcel.lat, pannedCenter.lng - parcel.lng) >
+    0.008;
 
   return (
-    <div className="relative h-[390px] w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-100">
+    <div
+      data-testid="satellite-map-container"
+      className="relative h-[400px] w-full overflow-hidden rounded-xl border border-slate-200 bg-slate-100 select-none"
+    >
       <GoogleMap
         mapId="DEMO_MAP_ID"
-        center={{ lat: parcel.lat, lng: parcel.lng }}
-        zoom={zoom}
+        defaultCenter={{ lat: parcel.lat, lng: parcel.lng }}
+        defaultZoom={11}
         mapTypeId={mapType}
         gestureHandling="greedy"
+        clickableIcons={false}
         mapTypeControl={false}
         streetViewControl={false}
+        fullscreenControl={false}
+        zoomControl={false}
         internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
-        onZoomChanged={(e) => setZoom(e.detail.zoom)}
+        onIdle={(ev) => {
+          const c = ev.map.getCenter();
+          if (c) {
+            setPannedCenter({
+              lat: Number(c.lat().toFixed(4)),
+              lng: Number(c.lng().toFixed(4)),
+            });
+          }
+        }}
         onClick={(ev) => {
           const ll = ev.detail.latLng;
           if (ll) {
@@ -526,6 +1216,13 @@ function SatelliteMapCanvas({
         }}
         style={{ width: '100%', height: '100%' }}
       >
+        <MapCameraController
+          targetLat={parcel.lat}
+          targetLng={parcel.lng}
+          recenterSeq={recenterSeq}
+          zoomCommand={zoomCommand}
+        />
+
         <AdvancedMarker
           ref={markerRef}
           position={{ lat: parcel.lat, lng: parcel.lng }}
@@ -548,6 +1245,19 @@ function SatelliteMapCanvas({
         )}
       </GoogleMap>
 
+      {/* Subtle center reticle when panning with cursor */}
+      {isPannedAway && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 flex items-center justify-center"
+        >
+          <div className="flex h-7 w-7 items-center justify-center rounded-full border border-white/80 bg-slate-950/35 text-white shadow-sm">
+            <Crosshair className="h-3.5 w-3.5" />
+          </div>
+        </div>
+      )}
+
+      {/* Top-Left Hybrid / Terrain Switcher */}
       <div className="absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white/95 p-1 shadow-xs">
         {(['hybrid', 'terrain'] as const).map((t) => (
           <button
@@ -564,6 +1274,83 @@ function SatelliteMapCanvas({
           </button>
         ))}
       </div>
+
+      {/* Top-Right Native Zoom & Recenter Controls */}
+      <div className="absolute right-3 top-3 z-10 flex items-center gap-1 rounded-lg border border-slate-200 bg-white/95 p-1 shadow-xs">
+        <button
+          type="button"
+          aria-label="Zoom in"
+          onClick={() =>
+            setZoomCommand((prev) => ({ seq: prev.seq + 1, delta: 1 }))
+          }
+          className="rounded-md p-1.5 text-slate-700 hover:bg-slate-100"
+          title="Zoom in"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          aria-label="Zoom out"
+          onClick={() =>
+            setZoomCommand((prev) => ({ seq: prev.seq + 1, delta: -1 }))
+          }
+          className="rounded-md p-1.5 text-slate-700 hover:bg-slate-100"
+          title="Zoom out"
+        >
+          <Minus className="h-3.5 w-3.5" />
+        </button>
+        <div className="h-4 w-px bg-slate-200" aria-hidden="true" />
+        <button
+          type="button"
+          aria-label="Recenter map on active parcel"
+          data-testid="map-recenter-btn"
+          onClick={() => {
+            setRecenterSeq((s) => s + 1);
+            setPannedCenter({ lat: parcel.lat, lng: parcel.lng });
+          }}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+          title="Recenter camera on active parcel pin"
+        >
+          <RotateCcw className="h-3 w-3" />
+          <span>Recenter</span>
+        </button>
+      </div>
+
+      {/* Bottom Floating Bar when User Pans Map with Cursor */}
+      {isPannedAway && (
+        <div
+          data-testid="map-panned-action-bar"
+          className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-slate-200 bg-white/95 px-3 py-1.5 text-xs shadow-md backdrop-blur-xs"
+        >
+          <span className="font-mono tabular-nums text-[11px] text-slate-600">
+            View: {pannedCenter.lat.toFixed(4)}, {pannedCenter.lng.toFixed(4)}
+          </span>
+          <button
+            type="button"
+            data-testid="inspect-panned-center-btn"
+            onClick={() =>
+              onInspectCoordinates(
+                pannedCenter.lat,
+                pannedCenter.lng,
+                `Field Sector (${pannedCenter.lat.toFixed(3)}, ${pannedCenter.lng.toFixed(3)})`
+              )
+            }
+            className="rounded-lg bg-sky-700 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-sky-800"
+          >
+            Inspect Map Center
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setRecenterSeq((s) => s + 1);
+              setPannedCenter({ lat: parcel.lat, lng: parcel.lng });
+            }}
+            className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-50"
+          >
+            Pin
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -786,18 +1573,8 @@ export function FieldObservatory({
 
             <div className="mt-4 border-t border-slate-100 pt-4">
               <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-500">
-                Inspect Any Global Coordinate
+                Direct Decimal Coordinate Tuner
               </p>
-
-              {mapsAvailable && (
-                <div className="mb-2.5">
-                  <PlacesSearchMount
-                    onPlacePicked={(lat, lng, label) =>
-                      onInspectCoordinates(lat, lng, label)
-                    }
-                  />
-                </div>
-              )}
 
               <form onSubmit={handleCoordinateSubmit} className="flex items-center gap-2">
                 <input
@@ -843,7 +1620,7 @@ export function FieldObservatory({
         </aside>
 
         {/* Right Primary Map & NASA KPI Header */}
-        <section className="min-w-0 space-y-4 rounded-xl border border-slate-200 bg-white p-4 lg:col-span-8">
+        <section className="min-w-0 space-y-3.5 rounded-xl border border-slate-200 bg-white p-4 lg:col-span-8">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <div className="flex items-center gap-2">
@@ -866,9 +1643,17 @@ export function FieldObservatory({
               </p>
             </div>
             <p className="text-xs font-medium text-slate-500">
-              Click map to inspect live 5-yr NASA telemetry
+              Drag freely to pan · Click any point to inspect live 5-yr NASA telemetry
             </p>
           </div>
+
+          {/* Unified Location & Agricultural Basin Omnibox Search Bar */}
+          <LocationOmnibox
+            parcel={parcel}
+            mapsAvailable={mapsAvailable}
+            onSelectParcel={onSelectParcel}
+            onInspectCoordinates={onInspectCoordinates}
+          />
 
           {nasaError && (
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
@@ -880,7 +1665,7 @@ export function FieldObservatory({
             <SatelliteMapCanvas
               parcel={parcel}
               nasa={nasa}
-              onInspectCoordinates={(lat, lng) => onInspectCoordinates(lat, lng)}
+              onInspectCoordinates={onInspectCoordinates}
             />
           ) : (
             <div className="flex h-[390px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 p-6 text-center">
@@ -889,7 +1674,7 @@ export function FieldObservatory({
                 Interactive Coordinate Observatory Active
               </p>
               <p className="mt-1 max-w-md text-xs text-slate-600">
-                Satellite map key is currently unavailable; use the benchmark parcel cards or custom latitude/longitude controls to pull live NASA POWER data anywhere on Earth.
+                Satellite map key is currently unavailable; use the omnibox search bar, benchmark parcel cards, or custom latitude/longitude controls to pull live NASA POWER data anywhere on Earth.
               </p>
             </div>
           )}

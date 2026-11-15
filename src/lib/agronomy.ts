@@ -1254,4 +1254,267 @@ export function deriveMultiYearClimateTrends(
   };
 }
 
+export interface ParsedCoordinateResult {
+  lat: number;
+  lng: number;
+  formatted: string;
+}
+
+/**
+ * Parses flexible coordinate strings such as:
+ * - "36.7378, -119.7871"
+ * - "36.7378 -119.7871"
+ * - "30.9010° N, 75.8573° E"
+ * - "lat: 41.5868, lng: -93.6250"
+ */
+export function parseCoordinateQuery(raw: string): ParsedCoordinateResult | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 80) return null;
+
+  // Reject plain text words that aren't coordinate labels or cardinal directions
+  const strippedAlpha = trimmed
+    .replace(/\b(lat|latitude|lng|lon|long|longitude)\b/gi, '')
+    .replace(/[°'"NSEWnsew,:\s+-.\d]/g, '');
+  if (strippedAlpha.length > 0) return null;
+
+  const tokenRegex = /([+-]?\d+(?:\.\d+)?)\s*°?\s*([NSEWnsew])?/g;
+  const matches = Array.from(trimmed.matchAll(tokenRegex));
+  if (matches.length !== 2) return null;
+
+  let firstVal = Number(matches[0][1]);
+  const firstDir = (matches[0][2] || '').toUpperCase();
+  let secondVal = Number(matches[1][1]);
+  const secondDir = (matches[1][2] || '').toUpperCase();
+
+  if (!Number.isFinite(firstVal) || !Number.isFinite(secondVal)) return null;
+
+  if (firstDir === 'S') firstVal = -Math.abs(firstVal);
+  if (firstDir === 'N') firstVal = Math.abs(firstVal);
+  if (firstDir === 'W') firstVal = -Math.abs(firstVal);
+  if (firstDir === 'E') firstVal = Math.abs(firstVal);
+
+  if (secondDir === 'S') secondVal = -Math.abs(secondVal);
+  if (secondDir === 'N') secondVal = Math.abs(secondVal);
+  if (secondDir === 'W') secondVal = -Math.abs(secondVal);
+  if (secondDir === 'E') secondVal = Math.abs(secondVal);
+
+  let lat = firstVal;
+  let lng = secondVal;
+
+  // Swap if user gave E/W first and N/S second
+  if ((firstDir === 'E' || firstDir === 'W') && (secondDir === 'N' || secondDir === 'S')) {
+    lat = secondVal;
+    lng = firstVal;
+  }
+
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+
+  const cleanLat = Number(lat.toFixed(4));
+  const cleanLng = Number(lng.toFixed(4));
+  return {
+    lat: cleanLat,
+    lng: cleanLng,
+    formatted: `${cleanLat.toFixed(4)}, ${cleanLng.toFixed(4)}`,
+  };
+}
+
+export interface AgriculturalDirectoryEntry {
+  id: string;
+  name: string;
+  region: string;
+  country: string;
+  lat: number;
+  lng: number;
+  soilType: string;
+  primaryCrop: string;
+  climateTag: string;
+  parcelPreset?: FarmParcelProfile;
+}
+
+export const GLOBAL_AGRICULTURAL_DIRECTORY: AgriculturalDirectoryEntry[] = [
+  ...CURATED_PARCELS.map((p) => ({
+    id: p.id,
+    name: p.name,
+    region: p.region,
+    country: p.region.split(',').pop()?.trim() || 'Global',
+    lat: p.lat,
+    lng: p.lng,
+    soilType: p.soilType,
+    primaryCrop: getCropById(p.currentCropId).name,
+    climateTag: 'Benchmark Parcel',
+    parcelPreset: p,
+  })),
+  {
+    id: 'dir-imperial-valley',
+    name: 'Imperial Valley Irrigated District',
+    region: 'El Centro, California, USA',
+    country: 'USA',
+    lat: 32.792,
+    lng: -115.5631,
+    soilType: 'Colorado River Alluvial Silt',
+    primaryCrop: 'Alfalfa & Winter Vegetables',
+    climateTag: 'Hyper-Arid Canal',
+  },
+  {
+    id: 'dir-sacramento-valley',
+    name: 'Sacramento Valley Rice & Orchard Belt',
+    region: 'Colusa County, California, USA',
+    country: 'USA',
+    lat: 39.2143,
+    lng: -122.0094,
+    soilType: 'Capay Silty Clay',
+    primaryCrop: 'Rice & Sunflower',
+    climateTag: 'Mediterranean Basin',
+  },
+  {
+    id: 'dir-ogallala-kansas',
+    name: 'Ogallala Aquifer High Plains Sector',
+    region: 'Garden City, Kansas, USA',
+    country: 'USA',
+    lat: 37.9717,
+    lng: -100.8727,
+    soilType: 'Richfield Silt Loam',
+    primaryCrop: 'Grain Sorghum & Winter Wheat',
+    climateTag: 'Aquifer Depletion Zone',
+  },
+  {
+    id: 'dir-palouse-washington',
+    name: 'Palouse Loess Dryland Hills',
+    region: 'Whitman County, Washington, USA',
+    country: 'USA',
+    lat: 46.7298,
+    lng: -117.1817,
+    soilType: 'Palouse Deep Windblown Loess',
+    primaryCrop: 'Winter Wheat & Chickpea',
+    climateTag: 'Steep Slope Erosion',
+  },
+  {
+    id: 'dir-mississippi-delta',
+    name: 'Mississippi Alluvial Plain',
+    region: 'Stuttgart, Arkansas, USA',
+    country: 'USA',
+    lat: 34.5004,
+    lng: -91.5526,
+    soilType: 'Sharkey Alluvial Clay Loam',
+    primaryCrop: 'Soybean & Maize',
+    climateTag: 'Humid Subtropical',
+  },
+  {
+    id: 'dir-red-river-nd',
+    name: 'Red River Valley Glacial Lake Plain',
+    region: 'Fargo, North Dakota, USA',
+    country: 'USA',
+    lat: 46.8772,
+    lng: -96.7898,
+    soilType: 'Fargo-Hegne Mollisol Clay',
+    primaryCrop: 'Spring Wheat & Oilseed Sunflower',
+    climateTag: 'Short Season Cold',
+  },
+  {
+    id: 'dir-nile-delta',
+    name: 'Nile River Delta Agronomic Basin',
+    region: 'Kafr El Sheikh, Nile Delta, Egypt',
+    country: 'Egypt',
+    lat: 31.1107,
+    lng: 30.9388,
+    soilType: 'Nile Alluvial Vertisol',
+    primaryCrop: 'Winter Wheat & Berseem Clover',
+    climateTag: 'Salinity & Heat Watch',
+  },
+  {
+    id: 'dir-murray-darling',
+    name: 'Murray-Darling Riverina Plain',
+    region: 'Griffith, New South Wales, Australia',
+    country: 'Australia',
+    lat: -34.2886,
+    lng: 146.0509,
+    soilType: 'Red-Brown Chromosol Loam',
+    primaryCrop: 'Winter Wheat & Chickpea',
+    climateTag: 'ENSO Drought Variability',
+  },
+  {
+    id: 'dir-pampas-argentina',
+    name: 'Humid Pampas Core Cropland',
+    region: 'Pergamino, Buenos Aires, Argentina',
+    country: 'Argentina',
+    lat: -33.89,
+    lng: -60.5736,
+    soilType: 'Typic Argiudoll Mollisol',
+    primaryCrop: 'Soybean & Maize Rotation',
+    climateTag: 'La Niña Moisture Swing',
+  },
+  {
+    id: 'dir-po-valley',
+    name: 'Po Valley Alluvial Plain',
+    region: 'Piacenza, Emilia-Romagna, Italy',
+    country: 'Italy',
+    lat: 45.0526,
+    lng: 9.693,
+    soilType: 'Calcareous Fluvisol Loam',
+    primaryCrop: 'Maize, Tomato & Alfalfa',
+    climateTag: 'Alpine Runoff Deficit',
+  },
+  {
+    id: 'dir-ukraine-chernozem',
+    name: 'Central Dnipro Chernozem Steppe',
+    region: 'Poltava Oblast, Ukraine',
+    country: 'Ukraine',
+    lat: 49.5883,
+    lng: 34.5514,
+    soilType: 'Deep Black Chernozem (5.2% SOC)',
+    primaryCrop: 'Oilseed Sunflower & Winter Wheat',
+    climateTag: 'Continental Steppe',
+  },
+  {
+    id: 'dir-mekong-delta',
+    name: 'Mekong Delta Alluvial Terrace',
+    region: 'Can Tho, Mekong Delta, Vietnam',
+    country: 'Vietnam',
+    lat: 10.0452,
+    lng: 105.7469,
+    soilType: 'Gleyic Fluvisol Silt',
+    primaryCrop: 'Rice & Mungbean Pulse',
+    climateTag: 'Monsoon & Tidal Intrusion',
+  },
+];
+
+export function searchAgriculturalDirectory(
+  query: string,
+  limit = 6
+): AgriculturalDirectoryEntry[] {
+  const q = query.trim().toLowerCase();
+  if (!q) {
+    return GLOBAL_AGRICULTURAL_DIRECTORY.slice(0, limit);
+  }
+
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const scored: Array<{ entry: AgriculturalDirectoryEntry; score: number }> = [];
+
+  for (const entry of GLOBAL_AGRICULTURAL_DIRECTORY) {
+    const nameL = entry.name.toLowerCase();
+    const regionL = entry.region.toLowerCase();
+    const countryL = entry.country.toLowerCase();
+    const cropL = entry.primaryCrop.toLowerCase();
+    const soilL = entry.soilType.toLowerCase();
+    const tagL = entry.climateTag.toLowerCase();
+    const combined = `${nameL} ${regionL} ${countryL} ${cropL} ${soilL} ${tagL} ${entry.lat} ${entry.lng}`;
+
+    const allMatched = tokens.every((tok) => combined.includes(tok));
+    if (!allMatched) continue;
+
+    let score = 10;
+    if (nameL.startsWith(q) || regionL.startsWith(q)) score += 50;
+    else if (nameL.includes(q)) score += 35;
+    else if (regionL.includes(q) || countryL.includes(q)) score += 25;
+    if (cropL.includes(q) || soilL.includes(q)) score += 15;
+    if (entry.parcelPreset) score += 8;
+
+    scored.push({ entry, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map((s) => s.entry);
+}
+
+
 

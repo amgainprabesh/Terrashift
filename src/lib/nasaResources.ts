@@ -388,6 +388,7 @@ export interface RawExternalTelemetryInput {
     shortwave_radiation_sum?: number[];
   };
   srtmElevations?: number[];
+  srtmGrid7x7?: number[];
   cdlByYear?: Array<{
     year: number;
     category: string;
@@ -901,3 +902,319 @@ export function synthesizeMultiSourceObservatory(
     datasetCatalog,
   };
 }
+
+export interface SoilHorizonLayer3D {
+  id: 'topsoil_oa' | 'subsoil_b' | 'water_table' | 'substratum_c' | 'bedrock_r';
+  code: string;
+  name: string;
+  simpleFarmerTitle: string;
+  depthRangeCm: string;
+  depthTopCm: number;
+  depthBottomCm: number;
+  thicknessCm: number;
+  moisturePct: number;
+  statusLabel: 'Optimal' | 'Adequate' | 'Dry Watch' | 'Deficit';
+  colorHex: string;
+  farmerExplanation: string;
+}
+
+export interface TerrainAndSoilProfile3D {
+  terrainSource: 'SRTM_DEM_LIVE_7X7' | 'SRTM_TOPOGRAPHIC_MODEL';
+  elevationGrid7x7: number[];
+  worldHeightGrid7x7: number[];
+  minElevationM: number;
+  maxElevationM: number;
+  centerElevationM: number;
+  reliefSpanM: number;
+  slopePct: number;
+  aspectDegrees: number;
+  aspectLabel: string;
+  drainageDirectionLabel: string;
+  waterTableDepthCm: number;
+  waterLevelFillPct: number;
+  cropRootDepthCm: number;
+  rootsReachWater: boolean;
+  rootWaterMarginCm: number;
+  farmerWaterSummary: string;
+  farmerTerrainSummary: string;
+  horizons: SoilHorizonLayer3D[];
+}
+
+/**
+ * Bilinearly samples a 7x7 height grid over normalized parcel coordinates u, v in [0, 1].
+ * u = 0 is West (-X), u = 1 is East (+X); v = 0 is North (-Z), v = 1 is South (+Z).
+ */
+export function sampleBilinearTerrainHeight(
+  grid7x7: number[],
+  u: number,
+  v: number
+): number {
+  if (!grid7x7 || grid7x7.length < 49) return 0;
+  const cu = Math.max(0, Math.min(1, u)) * 6;
+  const cv = Math.max(0, Math.min(1, v)) * 6;
+  const c0 = Math.min(5, Math.floor(cu));
+  const r0 = Math.min(5, Math.floor(cv));
+  const c1 = c0 + 1;
+  const r1 = r0 + 1;
+  const tx = cu - c0;
+  const ty = cv - r0;
+
+  const h00 = grid7x7[r0 * 7 + c0] ?? 0;
+  const h10 = grid7x7[r0 * 7 + c1] ?? 0;
+  const h01 = grid7x7[r1 * 7 + c0] ?? 0;
+  const h11 = grid7x7[r1 * 7 + c1] ?? 0;
+
+  const top = h00 * (1 - tx) + h10 * tx;
+  const bottom = h01 * (1 - tx) + h11 * tx;
+  return top * (1 - ty) + bottom * ty;
+}
+
+/**
+ * Builds the 3D terrain elevation grid (from live 7x7 SRTM DEM or coordinate-seeded model)
+ * and the 5-layer soil & water table profile for the active farm parcel.
+ */
+export function buildTerrainAndSoilProfile3D(
+  parcel: FarmParcelProfile,
+  nasa: NasaPowerSummary,
+  external: RawExternalTelemetryInput = {},
+  options: {
+    projectedRootMoisture?: number;
+    cropRootDepthM?: number;
+    cropName?: string;
+    irrigationOn?: boolean;
+  } = {}
+): TerrainAndSoilProfile3D {
+  const hasLiveGrid =
+    Array.isArray(external.srtmGrid7x7) && external.srtmGrid7x7.length === 49;
+
+  // Build or use 49-point (7x7) elevation grid in meters ASL
+  const elevationGrid7x7: number[] = [];
+  if (hasLiveGrid) {
+    for (let i = 0; i < 49; i++) {
+      elevationGrid7x7.push(Number(external.srtmGrid7x7![i].toFixed(1)));
+    }
+  } else {
+    const baseElev = nasa.elevationM || 250;
+    const seedLat = Math.sin(parcel.lat * 0.19) * Math.cos(parcel.lng * 0.13);
+    const seedLng = Math.cos(parcel.lat * 0.11) * Math.sin(parcel.lng * 0.17);
+    const reliefAmp = Math.max(4, Math.min(36, 5 + Math.abs(seedLat) * 22));
+    for (let r = -3; r <= 3; r++) {
+      for (let c = -3; c <= 3; c++) {
+        const slopeOffset = (r * seedLat * 0.28 + c * seedLng * 0.24) * reliefAmp;
+        const ridgeWave =
+          Math.sin((c + 3) * 0.72 + parcel.lat) *
+          Math.cos((r + 3) * 0.68 + parcel.lng) *
+          (reliefAmp * 0.26);
+        elevationGrid7x7.push(Number((baseElev + slopeOffset + ridgeWave).toFixed(1)));
+      }
+    }
+  }
+
+  const minElevationM = Math.round(Math.min(...elevationGrid7x7));
+  const maxElevationM = Math.round(Math.max(...elevationGrid7x7));
+  const centerElevationM = Math.round(elevationGrid7x7[24] ?? nasa.elevationM);
+  const reliefSpanM = Math.max(0, maxElevationM - minElevationM);
+
+  const cross5 =
+    Array.isArray(external.srtmElevations) && external.srtmElevations.length >= 5
+      ? external.srtmElevations
+      : [
+          elevationGrid7x7[24],
+          elevationGrid7x7[10],
+          elevationGrid7x7[38],
+          elevationGrid7x7[26],
+          elevationGrid7x7[22],
+        ];
+
+  const srtmMetrics = computeSrtmTerrainMetrics(
+    cross5,
+    parcel.lat,
+    0.005,
+    hasLiveGrid ? 'SRTM_OPEN_METEO_LIVE' : 'SRTM_MODEL'
+  );
+
+  // Convert real elevation relief into clear 3D world-space heights (-0.85 .. +0.85 world units)
+  // Even on flat plains (reliefSpanM <= 2m), preserve subtle micro-topographic swale relief so drainage is visible
+  const meanElev =
+    elevationGrid7x7.reduce((s, v) => s + v, 0) / elevationGrid7x7.length;
+  const maxAbsDev = Math.max(
+    0.5,
+    ...elevationGrid7x7.map((v) => Math.abs(v - meanElev))
+  );
+  // Target vertical relief amplitude in 3D world units (2.4x topographic vertical exaggeration so ridges and swales are unmistakably clear)
+  const worldReliefTarget = Math.min(
+    1.45,
+    Math.max(0.68, 0.55 + Math.log1p(reliefSpanM) * 0.26)
+  );
+
+  const worldHeightGrid7x7 = elevationGrid7x7.map((elev, idx) => {
+    const r = Math.floor(idx / 7);
+    const c = idx % 7;
+    const normalized = ((elev - meanElev) / maxAbsDev) * worldReliefTarget;
+    // Add subtle field-scale drainage swale micro-relief so water flow channels are visible even on gentle plains
+    const microSwale =
+      Math.sin(c * 0.85 + parcel.lat) *
+      Math.cos(r * 0.85 + parcel.lng) *
+      (reliefSpanM < 3 ? 0.24 : 0.12);
+    return Number((normalized + microSwale).toFixed(3));
+  });
+
+  // Compute soil moisture & 3D water table level
+  const om = external.openMeteoCurrent;
+  const irrigationBonus = options.irrigationOn ? 0.08 : 0;
+  const rootMoistureFrac = Math.max(
+    0.16,
+    Math.min(
+      0.92,
+      (options.projectedRootMoisture ?? nasa.meanRootMoisture) + irrigationBonus
+    )
+  );
+  const rootMoisturePct = Math.round(rootMoistureFrac * 100);
+
+  const liveTopsoilPct =
+    om?.soil_moisture_0_to_1cm !== undefined && om?.soil_moisture_3_to_9cm !== undefined
+      ? Math.round(
+          Math.min(
+            95,
+            ((om.soil_moisture_0_to_1cm + om.soil_moisture_3_to_9cm) / 2 / 0.46) * 100 +
+              (options.irrigationOn ? 8 : 0)
+          )
+        )
+      : Math.round(
+          Math.max(15, Math.min(92, nasa.meanSurfaceMoisture * 100 + (options.irrigationOn ? 8 : 0)))
+        );
+
+  const deepMoisturePct = Math.round(
+    Math.max(24, Math.min(94, rootMoisturePct * 1.08 + 4))
+  );
+  const aquiferSaturationPct = Math.round(
+    Math.max(48, Math.min(98, rootMoisturePct * 1.18 + 16))
+  );
+
+  // Water table depth below surface in cm (200 cm total cutaway column):
+  // High moisture (85%) -> water rises to ~32 cm below surface (84% fill)
+  // Moderate moisture (50%) -> water sits at ~96 cm below surface (52% fill)
+  // Severe drought (22%) -> water drops to ~158 cm below surface (21% fill)
+  const waterLevelFillPct = Math.round(
+    Math.max(16, Math.min(88, rootMoistureFrac * 96))
+  );
+  const waterTableDepthCm = Math.round(
+    Math.max(22, Math.min(176, 200 * (1 - waterLevelFillPct / 100)))
+  );
+
+  const cropRootDepthCm = Math.round((options.cropRootDepthM ?? 1.2) * 100);
+  // Capillary fringe extends ~18 cm above the main saturated water table
+  const effectiveWetTopCm = Math.max(15, waterTableDepthCm - 18);
+  const rootsReachWater = cropRootDepthCm >= effectiveWetTopCm;
+  const rootWaterMarginCm = cropRootDepthCm - effectiveWetTopCm;
+  const cropLabel = options.cropName ?? getCropById(parcel.currentCropId).name;
+
+  const farmerWaterSummary = rootsReachWater
+    ? `${cropLabel} roots (${cropRootDepthCm} cm deep) reach ${Math.max(5, rootWaterMarginCm)} cm into the wet capillary zone (water table at ${waterTableDepthCm} cm depth · ${waterLevelFillPct}% soil water column).`
+    : `Water level sits at ${waterTableDepthCm} cm depth (${waterLevelFillPct}% full), ${Math.abs(rootWaterMarginCm)} cm deeper than ${cropLabel} roots (${cropRootDepthCm} cm) — switch to deep-rooted crops or enable irrigation.`;
+
+  const drainageDirectionLabel =
+    srtmMetrics.slopePct < 0.3
+      ? 'Level Basin (Slow Vertical Infiltration)'
+      : `Drains ${srtmMetrics.aspectLabel.replace('-Facing', '')} (${srtmMetrics.slopePct}% Grade)`;
+
+  const farmerTerrainSummary = `${centerElevationM}m elevation (${minElevationM}–${maxElevationM}m local relief) · ${srtmMetrics.slopePct}% ${srtmMetrics.aspectLabel.toLowerCase()} slope · ${srtmMetrics.erosionRiskClass.toLowerCase()} runoff risk.`;
+
+  const horizons: SoilHorizonLayer3D[] = [
+    {
+      id: 'topsoil_oa',
+      code: 'O / A HORIZON',
+      name: 'Topsoil & Seedbed',
+      simpleFarmerTitle: 'Layer 1 · Living Topsoil (0–25 cm)',
+      depthRangeCm: '0 – 25 cm',
+      depthTopCm: 0,
+      depthBottomCm: 25,
+      thicknessCm: 25,
+      moisturePct: liveTopsoilPct,
+      statusLabel: classifyMoistureStatus(liveTopsoilPct),
+      colorHex: '#4a3525',
+      farmerExplanation: `${parcel.soilType} with ${parcel.baselineOrganicCarbon}% organic carbon. Holds seed moisture, residue humus, and early feeder roots.`,
+    },
+    {
+      id: 'subsoil_b',
+      code: 'B HORIZON',
+      name: 'Active Root Subsoil',
+      simpleFarmerTitle: 'Layer 2 · Main Root Drinking Zone (25–80 cm)',
+      depthRangeCm: '25 – 80 cm',
+      depthTopCm: 25,
+      depthBottomCm: 80,
+      thicknessCm: 55,
+      moisturePct: rootMoisturePct,
+      statusLabel: classifyMoistureStatus(rootMoisturePct),
+      colorHex: '#7c4d32',
+      farmerExplanation: `Mineral clay-loam subsoil storing seasonal rainfall and nitrogen. Supplies ~70% of cash-crop water uptake.`,
+    },
+    {
+      id: 'water_table',
+      code: 'SOIL WATER LEVEL',
+      name: 'Capillary Water Table',
+      simpleFarmerTitle: `3D Soil Water Level (${waterTableDepthCm} cm Depth · ${waterLevelFillPct}% Full)`,
+      depthRangeCm: `${waterTableDepthCm} – 200 cm`,
+      depthTopCm: waterTableDepthCm,
+      depthBottomCm: 200,
+      thicknessCm: 200 - waterTableDepthCm,
+      moisturePct: waterLevelFillPct,
+      statusLabel: classifyMoistureStatus(rootMoisturePct),
+      colorHex: '#0284c7',
+      farmerExplanation: rootsReachWater
+        ? `Active roots (${cropRootDepthCm} cm) penetrate this wet zone directly, buffering mid-summer heat stress.`
+        : `Water level has receded below current root reach (${cropRootDepthCm} cm). Deep-root rotation or irrigation needed.`,
+    },
+    {
+      id: 'substratum_c',
+      code: 'C HORIZON',
+      name: 'Deep Taproot Substratum',
+      simpleFarmerTitle: 'Layer 3 · Deep Moisture Reserve (80–150 cm)',
+      depthRangeCm: '80 – 150 cm',
+      depthTopCm: 80,
+      depthBottomCm: 150,
+      thicknessCm: 70,
+      moisturePct: deepMoisturePct,
+      statusLabel: classifyMoistureStatus(deepMoisturePct),
+      colorHex: '#8d6e53',
+      farmerExplanation: `Weathered parent material. Only deep taproots (Sorghum 150 cm, Sunflower 180 cm, Alfalfa 220 cm) can unlock this reserve.`,
+    },
+    {
+      id: 'bedrock_r',
+      code: 'R HORIZON & AQUIFER',
+      name: 'Parent Bedrock & Aquifer Base',
+      simpleFarmerTitle: 'Layer 4 · Bedrock & Perched Aquifer (150–200 cm)',
+      depthRangeCm: '150 – 200 cm',
+      depthTopCm: 150,
+      depthBottomCm: 200,
+      thicknessCm: 50,
+      moisturePct: aquiferSaturationPct,
+      statusLabel: classifyMoistureStatus(aquiferSaturationPct),
+      colorHex: '#475569',
+      farmerExplanation: `Consolidating rock & deep groundwater table supporting long-term watershed recharge beneath the parcel.`,
+    },
+  ];
+
+  return {
+    terrainSource: hasLiveGrid ? 'SRTM_DEM_LIVE_7X7' : 'SRTM_TOPOGRAPHIC_MODEL',
+    elevationGrid7x7,
+    worldHeightGrid7x7,
+    minElevationM,
+    maxElevationM,
+    centerElevationM,
+    reliefSpanM,
+    slopePct: srtmMetrics.slopePct,
+    aspectDegrees: srtmMetrics.aspectDegrees,
+    aspectLabel: srtmMetrics.aspectLabel,
+    drainageDirectionLabel,
+    waterTableDepthCm,
+    waterLevelFillPct,
+    cropRootDepthCm,
+    rootsReachWater,
+    rootWaterMarginCm,
+    farmerWaterSummary,
+    farmerTerrainSummary,
+    horizons,
+  };
+}
+

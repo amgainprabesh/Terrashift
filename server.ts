@@ -168,20 +168,35 @@ app.get('/api/nasa/multi-source', async (req, res) => {
     }
   })();
 
-  // 2. SRTM 5-point elevation cross [Center, North, South, East, West] for slope & RUSLE LS
+  // 2. SRTM 7x7 (49-point) Digital Elevation Model grid (~1.6km x 1.6km around parcel) + 5-point cross
   const srtmPromise = (async () => {
     try {
-      const d = 0.005;
-      const lats = [lat, lat + d, lat - d, lat, lat].map((v) => v.toFixed(4)).join(',');
-      const lngs = [lng, lng, lng, lng + d, lng - d].map((v) => v.toFixed(4)).join(',');
+      const step = 0.0025; // 2 steps = 0.005 deg for N/S/E/W cross
+      const lats: string[] = [];
+      const lngs: string[] = [];
+      for (let r = -3; r <= 3; r++) {
+        for (let c = -3; c <= 3; c++) {
+          // Row 0 is North (+3*step), Row 6 is South (-3*step); Col 0 is West (-3*step), Col 6 is East (+3*step)
+          lats.push((lat - r * step).toFixed(4));
+          lngs.push((lng + c * step).toFixed(4));
+        }
+      }
       const r = await fetch(
-        `https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lngs}`,
-        { signal: AbortSignal.timeout(4000) }
+        `https://api.open-meteo.com/v1/elevation?latitude=${lats.join(',')}&longitude=${lngs.join(',')}`,
+        { signal: AbortSignal.timeout(4500) }
       );
       if (r.ok) {
         const j = (await r.json()) as { elevation?: number[] };
-        if (Array.isArray(j.elevation) && j.elevation.length >= 5) {
-          result.srtmElevations = j.elevation;
+        if (Array.isArray(j.elevation) && j.elevation.length === 49) {
+          result.srtmGrid7x7 = j.elevation;
+          // Extract [Center(r=0,c=0 -> idx 24), North(r=-2,c=0 -> idx 10), South(r=+2,c=0 -> idx 38), East(r=0,c=+2 -> idx 26), West(r=0,c=-2 -> idx 22)]
+          result.srtmElevations = [
+            j.elevation[24],
+            j.elevation[10],
+            j.elevation[38],
+            j.elevation[26],
+            j.elevation[22],
+          ];
         }
       }
     } catch {

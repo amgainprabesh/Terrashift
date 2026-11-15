@@ -6,9 +6,11 @@ import {
 } from './agronomy';
 import {
   buildNasaGibsWmsUrl,
+  buildTerrainAndSoilProfile3D,
   computeSrtmTerrainMetrics,
   latLngToAlbers5070,
   NASA_GIBS_LAYERS,
+  sampleBilinearTerrainHeight,
   synthesizeMultiSourceObservatory,
 } from './nasaResources';
 
@@ -89,3 +91,58 @@ test('synthesizeMultiSourceObservatory fuses live ERA5/SMAP, SRTM, USDA CDL, and
   assert.ok(payload.datasetCatalog.length >= 14);
   assert.ok(payload.marketBenchmarks.length >= 7);
 });
+
+test('buildTerrainAndSoilProfile3D constructs 7x7 SRTM terrain relief, 5 soil layers, and water table depth', () => {
+  const caParcel = CURATED_PARCELS[1];
+  const nasa = buildDeterministicFallbackPower(caParcel.lat, caParcel.lng);
+
+  // Create a 49-point grid sloping from 140m in the North down to 80m in the South
+  const grid49: number[] = [];
+  for (let r = 0; r < 7; r++) {
+    for (let c = 0; c < 7; c++) {
+      grid49.push(140 - r * 10 + c * 1.5);
+    }
+  }
+
+  const dryProfile = buildTerrainAndSoilProfile3D(
+    caParcel,
+    nasa,
+    { srtmGrid7x7: grid49 },
+    {
+      projectedRootMoisture: 0.25,
+      cropRootDepthM: 0.65,
+      cropName: 'Shallow Vegetable',
+      irrigationOn: false,
+    }
+  );
+
+  const wetProfile = buildTerrainAndSoilProfile3D(
+    caParcel,
+    nasa,
+    { srtmGrid7x7: grid49 },
+    {
+      projectedRootMoisture: 0.68,
+      cropRootDepthM: 1.6,
+      cropName: 'Grain Sorghum',
+      irrigationOn: true,
+    }
+  );
+
+  assert.equal(dryProfile.terrainSource, 'SRTM_DEM_LIVE_7X7');
+  assert.equal(dryProfile.elevationGrid7x7.length, 49);
+  assert.equal(dryProfile.worldHeightGrid7x7.length, 49);
+  assert.equal(dryProfile.horizons.length, 5);
+  assert.ok(dryProfile.reliefSpanM >= 55);
+
+  // Wet profile has higher water fill % and shallower water table depth than dry profile
+  assert.ok(wetProfile.waterLevelFillPct > dryProfile.waterLevelFillPct);
+  assert.ok(wetProfile.waterTableDepthCm < dryProfile.waterTableDepthCm);
+  assert.equal(wetProfile.rootsReachWater, true);
+  assert.equal(dryProfile.rootsReachWater, false);
+
+  // Bilinear sampler interpolates smoothly between North (v=0, higher) and South (v=1, lower)
+  const northH = sampleBilinearTerrainHeight(dryProfile.worldHeightGrid7x7, 0.5, 0.0);
+  const southH = sampleBilinearTerrainHeight(dryProfile.worldHeightGrid7x7, 0.5, 1.0);
+  assert.ok(northH > southH, `Expected northH (${northH}) > southH (${southH})`);
+});
+
