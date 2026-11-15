@@ -1,0 +1,6 @@
+{
+  "name": "TerraShift",
+  "description": "NASA Space Apps 2026 Field Shift decision-support platform combining live NASA POWER Earth observations, 3D soil-horizon digital twins, multi-year crop rotation optimization, Google Maps intelligence, Cloud SQL persistence, and Google Workspace exports.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
